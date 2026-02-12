@@ -1,0 +1,47 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Dataset (large files)
+archive/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Model checkpoints and outputs
+*.pth
+*.pt
+*.h5
+*.ckpt
+checkpoints/
+outputs/
+results/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Byte-compiled / optimized / DLL files
+*.so
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
