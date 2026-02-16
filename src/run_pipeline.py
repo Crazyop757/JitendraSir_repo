@@ -176,12 +176,15 @@ def prepare_multiclass_dataset():
     return multiclass_dir
 
 
-def train_one_epoch(model, train_loader, criterion, optimizer, device, model_name):
-    """Train for one epoch."""
+def train_one_epoch(model, train_loader, criterion, optimizer, device, model_name, epoch, total_epochs, fold):
+    """Train for one epoch with detailed progress display."""
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
+    
+    num_batches = len(train_loader)
+    print_freq = max(1, num_batches // 10)  # Print 10 times per epoch
     
     for batch_idx, (images, labels) in enumerate(train_loader):
         images, labels = images.to(device), labels.to(device)
@@ -203,6 +206,23 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device, model_nam
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
+        
+        # Show progress periodically
+        if (batch_idx + 1) % print_freq == 0 or (batch_idx + 1) == num_batches:
+            current_loss = running_loss / (batch_idx + 1)
+            current_acc = 100. * correct / total
+            progress_pct = 100. * (batch_idx + 1) / num_batches
+            
+            # Show GPU memory if available
+            mem_info = ""
+            if torch.cuda.is_available():
+                mem_allocated = torch.cuda.memory_allocated(device) / 1e9
+                mem_reserved = torch.cuda.memory_reserved(device) / 1e9
+                mem_info = f" | GPU: {mem_allocated:.2f}GB/{mem_reserved:.2f}GB"
+            
+            print(f"    [Fold {fold}, Epoch {epoch}/{total_epochs}] "
+                  f"Batch {batch_idx + 1}/{num_batches} ({progress_pct:.0f}%) | "
+                  f"Loss: {current_loss:.4f} | Acc: {current_acc:.2f}%{mem_info}")
     
     epoch_loss = running_loss / len(train_loader)
     epoch_acc = 100. * correct / total
@@ -283,17 +303,80 @@ def train_model_with_cv(model_name, config, data_dir, results_saver):
             train_dataset.dataset.transform = train_transform
             val_dataset.dataset.transform = val_transform
             
-            # Create data loaders
+            # Determine a safe batch size for this model by trying smaller sizes on a tiny subset
+            from torch.utils.data import Subset as _Subset
+            batch_sizes_to_try = [config.get('batch_size', 32), 16, 8, 4]
+            chosen_batch_size = config.get('batch_size', 32)
+
+            try:
+                # Create a tiny subset (up to 32 samples) from the train dataset for testing
+                small_n = min(32, len(train_dataset))
+                small_indices = list(range(small_n))
+                small_subset = _Subset(train_dataset.dataset, small_indices)
+
+                for bs in batch_sizes_to_try:
+                    try:
+                        test_loader = DataLoader(
+                            small_subset,
+                            batch_size=bs,
+                            shuffle=True,
+                            num_workers=0,
+                            pin_memory=True if config['device'] == 'cuda' else False
+                        )
+
+                        # Try a quick forward+backward pass
+                        tmp_model = get_model(model_name, config['num_classes'], pretrained=True)
+                        tmp_model = tmp_model.to(config['device'])
+                        tmp_model.train()
+
+                        # use a tiny optimizer & loss for the check
+                        tmp_optim = optim.Adam(tmp_model.parameters(), lr=1e-4)
+                        tmp_crit = nn.CrossEntropyLoss()
+
+                        batch = next(iter(test_loader))
+                        images, labels = batch[0].to(config['device']), batch[1].to(config['device'])
+
+                        tmp_optim.zero_grad()
+                        outputs = tmp_model(images)
+                        if hasattr(outputs, 'logits'):
+                            loss = tmp_crit(outputs.logits, labels)
+                        else:
+                            loss = tmp_crit(outputs, labels)
+                        loss.backward()
+                        tmp_optim.step()
+
+                        # If we reach here, this batch size works
+                        chosen_batch_size = bs
+                        del tmp_model, tmp_optim, tmp_crit, images, labels, outputs, loss
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        break
+
+                    except RuntimeError as e:
+                        # On OOM try next smaller batch size
+                        if 'out of memory' in str(e).lower():
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            continue
+                        else:
+                            raise
+            except Exception:
+                # If the quick test fails for any reason, fall back to configured batch size
+                chosen_batch_size = config.get('batch_size', 32)
+
+            print(f"[INFO] Using batch_size={chosen_batch_size} for model {model_name}")
+
+            # Create data loaders with the chosen batch size
             train_loader = DataLoader(
                 train_dataset, 
-                batch_size=config['batch_size'], 
+                batch_size=chosen_batch_size, 
                 shuffle=True,
                 num_workers=0,  # Set to 0 for Windows compatibility
                 pin_memory=True if config['device'] == 'cuda' else False
             )
             val_loader = DataLoader(
                 val_dataset, 
-                batch_size=config['batch_size'], 
+                batch_size=chosen_batch_size, 
                 shuffle=False,
                 num_workers=0,
                 pin_memory=True if config['device'] == 'cuda' else False
@@ -311,43 +394,130 @@ def train_model_with_cv(model_name, config, data_dir, results_saver):
                 weight_decay=config['weight_decay']
             )
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='min', factor=0.5, patience=2, verbose=True
+                optimizer, mode='min', factor=0.5, patience=2
             )
             
-            # Training loop
+            # Training loop with comprehensive checkpointing
             best_val_loss = float('inf')
             patience_counter = 0
+            training_history = []
+            
+            # Create checkpoint directory for this fold
+            fold_checkpoint_dir = os.path.join(config['results_dir'], model_name, f'fold_{fold+1}_checkpoints')
+            os.makedirs(fold_checkpoint_dir, exist_ok=True)
+            
+            print(f"\n  [INFO] Starting training for Fold {fold+1}")
+            print(f"  [INFO] Checkpoints will be saved to: {fold_checkpoint_dir}")
+            print(f"  [INFO] Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
+            print(f"  [INFO] Batches per epoch: {len(train_loader)}\n")
             
             for epoch in range(config['epochs']):
+                epoch_start_time = time.time()
+                print(f"\n  {'='*60}")
+                print(f"  Fold {fold+1}/{config['n_splits']} - Epoch {epoch+1}/{config['epochs']}")
+                print(f"  {'='*60}")
+                
+                # Train
                 train_loss, train_acc = train_one_epoch(
-                    model, train_loader, criterion, optimizer, config['device'], model_name
+                    model, train_loader, criterion, optimizer, config['device'], 
+                    model_name, epoch+1, config['epochs'], fold+1
                 )
                 
+                # Validate
+                print(f"\n    [INFO] Running validation...")
                 y_true, y_pred, y_proba, val_loss = validate(
                     model, val_loader, criterion, config['device'], config['num_classes']
                 )
                 
                 val_acc = 100. * np.mean(y_true == y_pred)
+                epoch_time = time.time() - epoch_start_time
                 
-                print(f"  Epoch {epoch+1}/{config['epochs']} | "
-                      f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}% | "
-                      f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+                # Calculate additional metrics for this epoch
+                from sklearn.metrics import f1_score
+                epoch_f1 = f1_score(y_true, y_pred, average='macro')
                 
+                print(f"\n  {'='*60}")
+                print(f"  Epoch {epoch+1}/{config['epochs']} Summary:")
+                print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+                print(f"  Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.2f}%")
+                print(f"  Val F1:     {epoch_f1:.4f}")
+                print(f"  Time:       {epoch_time:.2f}s")
+                print(f"  {'='*60}")
+                
+                # Store training history
+                history_entry = {
+                    'fold': fold + 1,
+                    'epoch': epoch + 1,
+                    'train_loss': train_loss,
+                    'train_acc': train_acc,
+                    'val_loss': val_loss,
+                    'val_acc': val_acc,
+                    'val_f1': epoch_f1,
+                    'lr': optimizer.param_groups[0]['lr'],
+                    'time': epoch_time,
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+                training_history.append(history_entry)
+                
+                # Save training history to CSV after each epoch
+                history_df = pd.DataFrame(training_history)
+                history_csv_path = os.path.join(fold_checkpoint_dir, 'training_history.csv')
+                history_df.to_csv(history_csv_path, index=False)
+                print(f"  [SAVED] Training history: {history_csv_path}")
+                
+                # Update learning rate
+                old_lr = optimizer.param_groups[0]['lr']
                 scheduler.step(val_loss)
+                new_lr = optimizer.param_groups[0]['lr']
+                if new_lr != old_lr:
+                    print(f"  [INFO] Learning rate reduced: {old_lr:.6f} -> {new_lr:.6f}")
                 
-                # Early stopping
+                # Save checkpoint after EVERY epoch (comprehensive backup)
+                checkpoint = {
+                    'epoch': epoch + 1,
+                    'fold': fold + 1,
+                    'model_name': model_name,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'train_loss': train_loss,
+                    'train_acc': train_acc,
+                    'val_loss': val_loss,
+                    'val_acc': val_acc,
+                    'val_f1': epoch_f1,
+                    'best_val_loss': best_val_loss,
+                    'patience_counter': patience_counter,
+                    'training_history': training_history,
+                    'config': config,
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+                checkpoint_path = os.path.join(fold_checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth')
+                torch.save(checkpoint, checkpoint_path)
+                print(f"  [SAVED] Checkpoint: {checkpoint_path}")
+                
+                # Early stopping logic
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     patience_counter = 0
                     best_model_state = model.state_dict().copy()
+                    
+                    # Save best model separately
+                    best_checkpoint_path = os.path.join(fold_checkpoint_dir, 'best_model.pth')
+                    torch.save(checkpoint, best_checkpoint_path)
+                    print(f"  [SAVED] New best model! Loss improved to {val_loss:.4f}")
+                    print(f"  [SAVED] Best checkpoint: {best_checkpoint_path}")
                 else:
                     patience_counter += 1
+                    print(f"  [INFO] No improvement. Patience counter: {patience_counter}/{config['early_stopping_patience']}")
                     if patience_counter >= config['early_stopping_patience']:
-                        print(f"  Early stopping at epoch {epoch+1}")
+                        print(f"\n  [INFO] Early stopping triggered at epoch {epoch+1}")
+                        print(f"  [INFO] Best validation loss was: {best_val_loss:.4f}")
                         break
             
             # Load best model and get final predictions
+            print(f"\n  [INFO] Loading best model for final evaluation...")
             model.load_state_dict(best_model_state)
+            print(f"  [INFO] Running final validation...")
             y_true, y_pred, y_proba, _ = validate(
                 model, val_loader, criterion, config['device'], config['num_classes']
             )
@@ -371,26 +541,50 @@ def train_model_with_cv(model_name, config, data_dir, results_saver):
             fold_time = time.time() - fold_start_time
             print(f"  Fold time: {fold_time/60:.2f} min")
             
-            # Save model checkpoint
+            # Save final model checkpoint with all information
             if config['save_models']:
                 model_dir = os.path.join(config['results_dir'], model_name)
                 os.makedirs(model_dir, exist_ok=True)
-                checkpoint_path = os.path.join(model_dir, f'{model_name}_fold{fold+1}.pth')
+                final_checkpoint_path = os.path.join(model_dir, f'{model_name}_fold{fold+1}_FINAL.pth')
                 torch.save({
                     'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
                     'config': config,
                     'fold': fold + 1,
-                    'metrics': metrics
-                }, checkpoint_path)
+                    'metrics': metrics,
+                    'training_history': training_history,
+                    'class_names': class_names,
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }, final_checkpoint_path)
+                print(f"  [SAVED] Final model checkpoint: {final_checkpoint_path}")
+                
+                # Also save training history as JSON
+                history_json_path = os.path.join(model_dir, f'{model_name}_fold{fold+1}_history.json')
+                with open(history_json_path, 'w') as f:
+                    json.dump(training_history, f, indent=2)
+                print(f"  [SAVED] Training history JSON: {history_json_path}")
             
             # Clear GPU memory
             del model
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
             
         except Exception as e:
-            print(f"[ERROR] Fold {fold + 1} failed: {e}")
+            print(f"\n{'='*70}")
+            print(f"[ERROR] Fold {fold + 1} failed with error: {e}")
+            print(f"{'='*70}")
             import traceback
             traceback.print_exc()
+            
+            # Save error information
+            error_log_path = os.path.join(config['results_dir'], model_name, f'fold_{fold+1}_ERROR.txt')
+            os.makedirs(os.path.dirname(error_log_path), exist_ok=True)
+            with open(error_log_path, 'w') as f:
+                f.write(f"Error occurred at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Error message: {str(e)}\n\n")
+                f.write("Full traceback:\n")
+                f.write(traceback.format_exc())
+            print(f"  [SAVED] Error log: {error_log_path}")
             continue
     
     # Compute cross-validation statistics
@@ -563,7 +757,13 @@ def main():
     # Train each model
     pipeline_start_time = time.time()
     
-    for model_name in config['models']:
+    total_models = len(config['models'])
+    for model_idx, model_name in enumerate(config['models'], 1):
+        print(f"\n\n{'#'*80}")
+        print(f"# MODEL {model_idx}/{total_models}: {model_name.upper()}")
+        print(f"# Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'#'*80}\n")
+        
         try:
             fold_metrics, cv_stats, class_names = train_model_with_cv(
                 model_name, config, config['data_dir'], results_saver
@@ -572,8 +772,37 @@ def main():
                 'fold_metrics': fold_metrics,
                 'cv_stats': cv_stats
             }
+            
+            print(f"\n{'#'*80}")
+            print(f"# MODEL {model_idx}/{total_models} COMPLETED: {model_name.upper()}")
+            print(f"# Finished at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"{'#'*80}\n")
+            
+            # Save intermediate progress summary
+            progress_file = os.path.join(config['results_dir'], 'PROGRESS_SUMMARY.txt')
+            with open(progress_file, 'w') as f:
+                f.write(f"Pipeline Progress Report\n")
+                f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"{'='*80}\n\n")
+                f.write(f"Models Completed: {len(all_results)}/{total_models}\n\n")
+                for completed_model, data in all_results.items():
+                    stats = data['cv_stats']
+                    f.write(f"{completed_model}:\n")
+                    f.write(f"  Accuracy:  {stats.get('accuracy_mean', 0):.4f} ± {stats.get('accuracy_std', 0):.4f}\n")
+                    f.write(f"  F1-Score:  {stats.get('f1_macro_mean', 0):.4f} ± {stats.get('f1_macro_std', 0):.4f}\n")
+                    f.write(f"  AUC-ROC:   {stats.get('auc_roc_macro_mean', 0):.4f} ± {stats.get('auc_roc_macro_std', 0):.4f}\n\n")
+                f.write(f"\nRemaining models: {total_models - len(all_results)}\n")
+                remaining = [m for m in config['models'] if m not in all_results]
+                if remaining:
+                    for rm in remaining:
+                        f.write(f"  - {rm}\n")
+            print(f"  [SAVED] Progress summary: {progress_file}\n")
+            
         except Exception as e:
-            print(f"\n[ERROR] Failed to train {model_name}: {e}")
+            print(f"\n{'#'*80}")
+            print(f"# MODEL {model_idx}/{total_models} FAILED: {model_name.upper()}")
+            print(f"# Error: {e}")
+            print(f"{'#'*80}\n")
             import traceback
             traceback.print_exc()
             continue

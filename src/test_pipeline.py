@@ -587,83 +587,99 @@ class PipelineTest:
         
         try:
             from models.models import get_model, get_model_input_size
-            
+
             device = 'cuda'
-            batch_size = 32  # Default batch size
-            
-            print_info(f"Estimating memory for batch_size={batch_size}")
-            
+
+            # Try a sequence of batch sizes until one fits to avoid false OOM failures
+            batch_sizes_to_try = [32, 16, 8, 4]
+
+            print_info(f"Estimating memory, trying batch sizes: {batch_sizes_to_try}")
+
             memory_requirements = {}
-            
+
             # Test each model
             for model_name in self.models_to_test:
                 torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats()
-                
+
                 try:
                     model = get_model(model_name, num_classes=5, pretrained=True)
                     model = model.to(device)
                     model.train()
-                    
+
                     input_size = get_model_input_size(model_name)
-                    
-                    # Try with default batch size
-                    try:
-                        dummy_input = torch.randn(batch_size, 3, input_size, input_size).to(device)
-                        output = model(dummy_input)
-                        if hasattr(output, 'logits'):
-                            output = output.logits
-                        
-                        loss = output.sum()
-                        loss.backward()
-                        
-                        peak_memory = torch.cuda.max_memory_allocated() / 1e9
-                        memory_requirements[model_name] = {
-                            'batch_size': batch_size,
-                            'peak_memory_gb': peak_memory,
-                            'status': 'OK'
-                        }
-                        
-                        del dummy_input, output, loss
-                        
-                    except RuntimeError as e:
-                        if 'out of memory' in str(e):
+
+                    # Try progressively smaller batch sizes
+                    success = False
+                    for batch_size in batch_sizes_to_try:
+                        try:
+                            dummy_input = torch.randn(batch_size, 3, input_size, input_size).to(device)
+                            output = model(dummy_input)
+                            if hasattr(output, 'logits'):
+                                output = output.logits
+
+                            loss = output.sum()
+                            loss.backward()
+
+                            # Ensure CUDA synchronization before reading peak stat
+                            try:
+                                torch.cuda.synchronize()
+                            except Exception:
+                                pass
+
+                            peak_memory = torch.cuda.max_memory_allocated() / 1e9
                             memory_requirements[model_name] = {
                                 'batch_size': batch_size,
-                                'status': 'OOM - reduce batch_size'
+                                'peak_memory_gb': peak_memory,
+                                'status': 'OK'
                             }
-                        else:
-                            raise
-                    
+
+                            del dummy_input, output, loss
+                            success = True
+                            break
+
+                        except RuntimeError as e:
+                            # try next smaller batch size on OOM
+                            if 'out of memory' in str(e).lower():
+                                torch.cuda.empty_cache()
+                                continue
+                            else:
+                                raise
+
+                    if not success:
+                        memory_requirements[model_name] = {
+                            'status': f"OOM - tried {batch_sizes_to_try}"
+                        }
+
                     del model
                     torch.cuda.empty_cache()
-                    
+
                 except Exception as e:
                     memory_requirements[model_name] = {
                         'status': f'Error: {str(e)}'
                     }
-            
+
             # Print results
             total_gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
             print_info(f"Total GPU Memory: {total_gpu_memory:.2f} GB")
-            
+
             all_ok = True
             for model_name, info in memory_requirements.items():
-                if info['status'] == 'OK':
+                if info.get('status') == 'OK':
                     mem = info['peak_memory_gb']
                     pct = (mem / total_gpu_memory) * 100
-                    print_pass(f"{model_name}: {mem:.2f} GB ({pct:.1f}%)")
+                    print_pass(f"{model_name}: {mem:.2f} GB ({pct:.1f}%) - batch_size={info['batch_size']}")
                 else:
                     print_warn(f"{model_name}: {info['status']}")
-                    if 'OOM' in info['status']:
+                    if 'OOM' in str(info.get('status', '')).upper():
                         all_ok = False
-            
+
             if not all_ok:
-                print_warn("Consider reducing batch_size with --batch_size 16")
-            
+                print_warn("Consider reducing global batch_size (e.g. --batch_size 16) or use gradient accumulation")
+
             self.results['memory'] = all_ok
             return all_ok
-            
+
         except Exception as e:
             print_fail(f"Memory estimation failed: {e}")
             self.results['memory'] = False
