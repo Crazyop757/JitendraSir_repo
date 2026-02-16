@@ -1,0 +1,9 @@
+Error occurred at: 2026-02-12 18:27:46
+Error message: ReduceLROnPlateau.__init__() got an unexpected keyword argument 'verbose'
+
+Full traceback:
+Traceback (most recent call last):
+  File "/home/ubuntu/Documents/Rudra_bt24csa009/src/run_pipeline.py", line 396, in train_model_with_cv
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: ReduceLROnPlateau.__init__() got an unexpected keyword argument 'verbose'

@@ -25,14 +25,13 @@ __pycache__/
 *.log
 logs/
 
-# Model checkpoints and outputs
+# Model checkpoints and outputs (large files)
 *.pth
 *.pt
 *.h5
 *.ckpt
-checkpoints/
+**/fold_*_checkpoints/
 outputs/
-results/
 
 # OS files
 .DS_Store

@@ -1,0 +1,2 @@
+model,accuracy_mean,accuracy_std,precision_mean,precision_std,recall_mean,recall_std,f1_mean,f1_std,auc_mean,auc_std
+resnet50,0,0,0,0,0,0,0,0,0,0

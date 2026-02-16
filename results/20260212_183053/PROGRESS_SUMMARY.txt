@@ -1,0 +1,43 @@
+Pipeline Progress Report
+Generated: 2026-02-14 03:52:03
+================================================================================
+
+Models Completed: 7/7
+
+resnet50:
+  Accuracy:  0.9992 ± 0.0008
+  F1-Score:  0.9992 ± 0.0008
+  AUC-ROC:   1.0000 ± 0.0000
+
+densenet121:
+  Accuracy:  0.9990 ± 0.0007
+  F1-Score:  0.9990 ± 0.0007
+  AUC-ROC:   1.0000 ± 0.0000
+
+efficientnet_b4:
+  Accuracy:  0.9995 ± 0.0003
+  F1-Score:  0.9995 ± 0.0003
+  AUC-ROC:   1.0000 ± 0.0000
+
+se_resnet50:
+  Accuracy:  0.9996 ± 0.0003
+  F1-Score:  0.9996 ± 0.0003
+  AUC-ROC:   1.0000 ± 0.0000
+
+vit_b_16:
+  Accuracy:  0.9905 ± 0.0021
+  F1-Score:  0.9905 ± 0.0021
+  AUC-ROC:   0.9999 ± 0.0001
+
+swin_v2_t:
+  Accuracy:  0.9988 ± 0.0012
+  F1-Score:  0.9988 ± 0.0012
+  AUC-ROC:   1.0000 ± 0.0000
+
+hybrid_cnn_vit:
+  Accuracy:  0.9941 ± 0.0064
+  F1-Score:  0.9941 ± 0.0065
+  AUC-ROC:   0.9999 ± 0.0001
+
+
+Remaining models: 0
